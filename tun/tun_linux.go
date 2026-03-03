@@ -18,6 +18,7 @@ import (
 	"unsafe"
 
 	"github.com/tailscale/wireguard-go/conn"
+	"github.com/tailscale/wireguard-go/iobuf"
 	"github.com/tailscale/wireguard-go/rwcancel"
 	"golang.org/x/sys/unix"
 )
@@ -29,6 +30,7 @@ const (
 
 type NativeTun struct {
 	tunFile                 *os.File
+	tunRawConn              syscall.RawConn
 	index                   int32      // if index
 	errors                  chan error // async error handling
 	events                  chan Event // device related events
@@ -49,7 +51,7 @@ type NativeTun struct {
 	readBuff [virtioNetHdrLen + 65535]byte // if vnetHdr every read() is prefixed by virtioNetHdr
 
 	writeOpMu   sync.Mutex // writeOpMu guards the following fields
-	toWrite     []int
+	toWrite     groToWrite
 	tcpGROTable *tcpGROTable
 	udpGROTable *udpGROTable
 	gro         groDisablementFlags
@@ -354,31 +356,53 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	defer func() {
 		tun.tcpGROTable.reset()
 		tun.udpGROTable.reset()
+		tun.toWrite.reset()
 		tun.writeOpMu.Unlock()
 	}()
 	var (
 		errs  error
 		total int
 	)
-	tun.toWrite = tun.toWrite[:0]
-	if tun.vnetHdr {
-		err := handleGRO(bufs, offset, tun.tcpGROTable, tun.udpGROTable, tun.gro, &tun.toWrite)
-		if err != nil {
-			return 0, err
-		}
-		offset -= virtioNetHdrLen
-	} else {
+	if !tun.vnetHdr {
 		for i := range bufs {
-			tun.toWrite = append(tun.toWrite, i)
+			n, err := tun.tunFile.Write(bufs[i][offset:])
+			if errors.Is(err, syscall.EBADFD) {
+				return total, os.ErrClosed
+			}
+			if err != nil {
+				errs = errors.Join(errs, err)
+			} else {
+				total += n
+			}
 		}
+		return total, errs
 	}
-	for _, bufsI := range tun.toWrite {
-		n, err := tun.tunFile.Write(bufs[bufsI][offset:])
-		if errors.Is(err, syscall.EBADFD) {
+	err := handleGRO(bufs, offset, tun.tcpGROTable, tun.udpGROTable, tun.gro, &tun.toWrite)
+	if err != nil {
+		return 0, err
+	}
+	for _, nb := range tun.toWrite.iovs {
+		var werr error
+		var n int
+		err := tun.tunRawConn.Write(func(fd uintptr) bool {
+			for {
+				n, werr = unix.Writev(int(fd), nb)
+				if werr == syscall.EINTR {
+					continue // quick retry on interrupt, EINTR is never returned with partial writes
+				}
+				return werr != syscall.EAGAIN // poller retry on "would block"
+			}
+		})
+		// err is a poller error (e.g. fd closed before the syscall)
+		// werr is the Writev syscall error itself.
+		if err != nil {
+			return total, err
+		}
+		if errors.Is(werr, syscall.EBADFD) {
 			return total, os.ErrClosed
 		}
-		if err != nil {
-			errs = errors.Join(errs, err)
+		if werr != nil {
+			errs = errors.Join(errs, werr)
 		} else {
 			total += n
 		}
@@ -387,9 +411,9 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 }
 
 // handleVirtioRead splits in into bufs, leaving offset bytes at the front of
-// each buffer. It mutates sizes to reflect the size of each element of bufs,
-// and returns the number of packets read.
-func handleVirtioRead(in []byte, bufs [][]byte, sizes []int, offset int) (int, error) {
+// each buffer. It sets each buffer's Bytes length to reflect the size of each
+// element of bufs, and returns the number of packets read.
+func handleVirtioRead(in []byte, bufs []iobuf.View, offset int) (int, error) {
 	var hdr virtioNetHdr
 	err := hdr.decode(in)
 	if err != nil {
@@ -421,17 +445,18 @@ func handleVirtioRead(in []byte, bufs [][]byte, sizes []int, offset int) (int, e
 		options.HdrLen = options.CsumStart + tcpHLen
 	}
 
-	return GSOSplit(in, options, bufs, sizes, offset)
+	return GSOSplit(in, options, bufs, offset)
 }
 
-func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+func (tun *NativeTun) Read(bufs []iobuf.View, offset int) (int, error) {
 	tun.readOpMu.Lock()
 	defer tun.readOpMu.Unlock()
 	select {
 	case err := <-tun.errors:
 		return 0, err
 	default:
-		readInto := bufs[0][offset:]
+		iobuf.EnsureAllocated(bufs)
+		readInto := bufs[0].Bytes[offset:]
 		if tun.vnetHdr {
 			readInto = tun.readBuff[:]
 		}
@@ -443,9 +468,9 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 			return 0, err
 		}
 		if tun.vnetHdr {
-			return handleVirtioRead(readInto[:n], bufs, sizes, offset)
+			return handleVirtioRead(readInto[:n], bufs, offset)
 		} else {
-			sizes[0] = n
+			bufs[0].Bytes = bufs[0].Bytes[:n+offset]
 			return 1, nil
 		}
 	}
@@ -577,6 +602,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 
 // CreateTUNFromFile creates a Device from an os.File with the provided MTU.
 func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
+	var err error
 	tun := &NativeTun{
 		tunFile:                 file,
 		events:                  make(chan Event, 5),
@@ -584,7 +610,12 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 		statusListenersShutdown: make(chan struct{}),
 		tcpGROTable:             newTCPGROTable(),
 		udpGROTable:             newUDPGROTable(),
-		toWrite:                 make([]int, 0, conn.IdealBatchSize),
+		toWrite:                 newGROToWrite(),
+	}
+
+	tun.tunRawConn, err = tun.tunFile.SyscallConn()
+	if err != nil {
+		return nil, err
 	}
 
 	name, err := tun.Name()
@@ -640,7 +671,11 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
 		errors:      make(chan error, 5),
 		tcpGROTable: newTCPGROTable(),
 		udpGROTable: newUDPGROTable(),
-		toWrite:     make([]int, 0, conn.IdealBatchSize),
+		toWrite:     newGROToWrite(),
+	}
+	tun.tunRawConn, err = tun.tunFile.SyscallConn()
+	if err != nil {
+		return nil, "", err
 	}
 	name, err := tun.Name()
 	if err != nil {

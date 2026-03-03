@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tailscale/wireguard-go/conn"
+	"github.com/tailscale/wireguard-go/iobuf"
 	"github.com/tailscale/wireguard-go/tun"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
@@ -46,8 +47,8 @@ import (
  */
 
 type QueueOutboundElement struct {
-	buffer *[MaxMessageSize]byte // slice holding the packet data
-	// packet is always a slice of "buffer". The starting offset in buffer
+	buffer iobuf.View
+	// packet is always a slice of buf. The starting offset in buf
 	// is either:
 	//  a) MessageEncapsulatingTransportSize+MessageTransportHeaderSize (plaintext)
 	//  b) 0 (post-encryption)
@@ -62,20 +63,12 @@ type QueueOutboundElementsContainer struct {
 	elems []*QueueOutboundElement
 }
 
-func (device *Device) NewOutboundElement() *QueueOutboundElement {
-	elem := device.GetOutboundElement()
-	elem.buffer = device.GetMessageBuffer()
-	elem.nonce = 0
-	// keypair and peer were cleared (if necessary) by clearPointers.
-	return elem
-}
-
 // clearPointers clears elem fields that contain pointers.
 // This makes the garbage collector's life easier and
 // avoids accidentally keeping other objects around unnecessarily.
 // It also reduces the possible collateral damage from use-after-free bugs.
 func (elem *QueueOutboundElement) clearPointers() {
-	elem.buffer = nil
+	elem.buffer = iobuf.View{}
 	elem.packet = nil
 	elem.keypair = nil
 	elem.peer = nil
@@ -85,14 +78,15 @@ func (elem *QueueOutboundElement) clearPointers() {
  */
 func (peer *Peer) SendKeepalive() {
 	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
-		elem := peer.device.NewOutboundElement()
+		elem := peer.device.GetOutboundElement()
+		elem.buffer = iobuf.View{Bytes: make([]byte, MessageEncapsulatingTransportSize+MessageTransportSize)}
 		elemsContainer := peer.device.GetOutboundElementsContainer()
 		elemsContainer.elems = append(elemsContainer.elems, elem)
 		select {
 		case peer.queue.staged <- elemsContainer:
 			peer.device.log.Verbosef("%v - Sending keepalive packet", peer)
 		default:
-			peer.device.PutMessageBuffer(elem.buffer)
+			elem.buffer.Release()
 			peer.device.PutOutboundElement(elem)
 			peer.device.PutOutboundElementsContainer(elemsContainer)
 		}
@@ -128,15 +122,16 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return err
 	}
 
-	buf := make([]byte, MessageEncapsulatingTransportSize+MessageInitiationSize)
-	packet := buf[MessageEncapsulatingTransportSize:]
+	buf := iobuf.View{Bytes: make([]byte, MessageEncapsulatingTransportSize+MessageInitiationSize)}
+	defer buf.Release()
+	packet := buf.Bytes[MessageEncapsulatingTransportSize:]
 	_ = msg.marshal(packet)
 	peer.cookieGenerator.AddMacs(packet)
 
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 
-	err = peer.SendBuffers([][]byte{buf})
+	err = peer.SendBuffers([][]byte{buf.Bytes})
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
 	}
@@ -158,8 +153,9 @@ func (peer *Peer) SendHandshakeResponse() error {
 		return err
 	}
 
-	buf := make([]byte, MessageEncapsulatingTransportSize+MessageResponseSize)
-	packet := buf[MessageEncapsulatingTransportSize:]
+	buf := iobuf.View{Bytes: make([]byte, MessageEncapsulatingTransportSize+MessageResponseSize)}
+	defer buf.Release()
+	packet := buf.Bytes[MessageEncapsulatingTransportSize:]
 	_ = response.marshal(packet)
 	peer.cookieGenerator.AddMacs(packet)
 
@@ -174,7 +170,7 @@ func (peer *Peer) SendHandshakeResponse() error {
 	peer.timersAnyAuthenticatedPacketSent()
 
 	// TODO: allocation could be avoided
-	err = peer.SendBuffers([][]byte{buf})
+	err = peer.SendBuffers([][]byte{buf.Bytes})
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake response: %v", peer, err)
 	}
@@ -191,11 +187,12 @@ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement)
 		return err
 	}
 
-	buf := make([]byte, MessageEncapsulatingTransportSize+MessageCookieReplySize)
-	packet := buf[MessageEncapsulatingTransportSize:]
+	buf := iobuf.View{Bytes: make([]byte, MessageEncapsulatingTransportSize+MessageCookieReplySize)}
+	defer buf.Release()
+	packet := buf.Bytes[MessageEncapsulatingTransportSize:]
 	_ = reply.marshal(packet)
-	// TODO: allocation could be avoided
-	device.net.bind.Send([][]byte{buf}, initiatingElem.endpoint, MessageEncapsulatingTransportSize)
+
+	device.net.bind.Send([][]byte{buf.Bytes}, initiatingElem.endpoint, MessageEncapsulatingTransportSize)
 
 	return nil
 }
@@ -223,57 +220,43 @@ func (device *Device) RoutineReadFromTUN() {
 	var (
 		batchSize   = device.BatchSize()
 		readErr     error
-		elems       = make([]*QueueOutboundElement, batchSize)
-		bufs        = make([][]byte, batchSize)
+		bufs        = make([]iobuf.View, batchSize)
 		elemsByPeer = make(map[*Peer]*QueueOutboundElementsContainer, batchSize)
 		count       = 0
-		sizes       = make([]int, batchSize)
 		offset      = MessageEncapsulatingTransportSize + MessageTransportHeaderSize
 	)
 
-	for i := range elems {
-		elems[i] = device.NewOutboundElement()
-		bufs[i] = elems[i].buffer[:]
-	}
-
 	defer func() {
-		for _, elem := range elems {
-			if elem != nil {
-				device.PutMessageBuffer(elem.buffer)
-				device.PutOutboundElement(elem)
-			}
-		}
+		iobuf.ReleaseAll(bufs)
 	}()
 
 	for {
-		// read packets
-		count, readErr = device.tun.device.Read(bufs, sizes, offset)
+		count, readErr = device.tun.device.Read(bufs, offset)
+
 		for i := 0; i < count; i++ {
-			if sizes[i] < 1 {
+			packet := bufs[i].Bytes[offset:]
+			if len(packet) < 1 {
 				continue
 			}
 
-			elem := elems[i]
-			elem.packet = bufs[i][offset : offset+sizes[i]]
-
 			// lookup peer
 			var peer *Peer
-			switch elem.packet[0] >> 4 {
+			switch packet[0] >> 4 {
 			case 4:
-				if len(elem.packet) < ipv4.HeaderLen {
+				if len(packet) < ipv4.HeaderLen {
 					continue
 				}
-				src := netip.AddrFrom4([4]byte(elem.packet[IPv4offsetSrc : IPv4offsetSrc+net.IPv4len]))
-				dst := netip.AddrFrom4([4]byte(elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]))
-				peer = device.allowedips.LookupFromPacket(src, dst, elem.packet)
+				src := netip.AddrFrom4([4]byte(packet[IPv4offsetSrc : IPv4offsetSrc+net.IPv4len]))
+				dst := netip.AddrFrom4([4]byte(packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]))
+				peer = device.allowedips.LookupFromPacket(src, dst, packet)
 
 			case 6:
-				if len(elem.packet) < ipv6.HeaderLen {
+				if len(packet) < ipv6.HeaderLen {
 					continue
 				}
-				src := netip.AddrFrom16([16]byte(elem.packet[IPv6offsetSrc : IPv6offsetSrc+net.IPv6len]))
-				dst := netip.AddrFrom16([16]byte(elem.packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]))
-				peer = device.allowedips.LookupFromPacket(src, dst, elem.packet)
+				src := netip.AddrFrom16([16]byte(packet[IPv6offsetSrc : IPv6offsetSrc+net.IPv6len]))
+				dst := netip.AddrFrom16([16]byte(packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]))
+				peer = device.allowedips.LookupFromPacket(src, dst, packet)
 
 			default:
 				device.log.Verbosef("Received packet with unknown IP version")
@@ -282,15 +265,19 @@ func (device *Device) RoutineReadFromTUN() {
 			if peer == nil {
 				continue
 			}
+
+			elem := device.GetOutboundElement()
+			elem.packet = packet
+			elem.buffer = bufs[i].Claim()
+
 			elemsForPeer, ok := elemsByPeer[peer]
 			if !ok {
 				elemsForPeer = device.GetOutboundElementsContainer()
 				elemsByPeer[peer] = elemsForPeer
 			}
 			elemsForPeer.elems = append(elemsForPeer.elems, elem)
-			elems[i] = device.NewOutboundElement()
-			bufs[i] = elems[i].buffer[:]
 		}
+		iobuf.ReleaseAll(bufs[:count]) // release unclaimed
 
 		for peer, elemsForPeer := range elemsByPeer {
 			if peer.isRunning.Load() {
@@ -298,7 +285,7 @@ func (device *Device) RoutineReadFromTUN() {
 				peer.SendStagedPackets()
 			} else {
 				for _, elem := range elemsForPeer.elems {
-					device.PutMessageBuffer(elem.buffer)
+					elem.buffer.Release()
 					device.PutOutboundElement(elem)
 				}
 				device.PutOutboundElementsContainer(elemsForPeer)
@@ -335,7 +322,7 @@ func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) {
 		select {
 		case tooOld := <-peer.queue.staged:
 			for _, elem := range tooOld.elems {
-				peer.device.PutMessageBuffer(elem.buffer)
+				elem.buffer.Release()
 				peer.device.PutOutboundElement(elem)
 			}
 			peer.device.PutOutboundElementsContainer(tooOld)
@@ -396,7 +383,7 @@ top:
 				peer.device.queue.encryption.c <- elemsContainer
 			} else {
 				for _, elem := range elemsContainer.elems {
-					peer.device.PutMessageBuffer(elem.buffer)
+					elem.buffer.Release()
 					peer.device.PutOutboundElement(elem)
 				}
 				peer.device.PutOutboundElementsContainer(elemsContainer)
@@ -416,7 +403,7 @@ func (peer *Peer) FlushStagedPackets() {
 		select {
 		case elemsContainer := <-peer.queue.staged:
 			for _, elem := range elemsContainer.elems {
-				peer.device.PutMessageBuffer(elem.buffer)
+				elem.buffer.Release()
 				peer.device.PutOutboundElement(elem)
 			}
 			peer.device.PutOutboundElementsContainer(elemsContainer)
@@ -456,7 +443,7 @@ func (device *Device) RoutineEncryption(id int) {
 	for elemsContainer := range device.queue.encryption.c {
 		for _, elem := range elemsContainer.elems {
 			// populate header fields
-			header := elem.buffer[MessageEncapsulatingTransportSize : MessageEncapsulatingTransportSize+MessageTransportHeaderSize]
+			header := elem.buffer.Bytes[MessageEncapsulatingTransportSize : MessageEncapsulatingTransportSize+MessageTransportHeaderSize]
 
 			fieldType := header[0:4]
 			fieldReceiver := header[4:8]
@@ -481,7 +468,8 @@ func (device *Device) RoutineEncryption(id int) {
 			)
 
 			// re-slice packet to include encapsulating transport space
-			elem.packet = elem.buffer[:MessageEncapsulatingTransportSize+len(elem.packet)]
+			elem.buffer.Bytes = elem.buffer.Bytes[:MessageEncapsulatingTransportSize+len(elem.packet)]
+			elem.packet = elem.buffer.Bytes
 		}
 		elemsContainer.Unlock()
 	}
@@ -495,10 +483,12 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 	}()
 	device.log.Verbosef("%v - Routine: sequential sender - started", peer)
 
-	bufs := make([][]byte, 0, maxBatchSize)
+	toWrite := make([]iobuf.View, 0, maxBatchSize) // reference to transferred buffers, released after batch write
+	bufs := make([][]byte, 0, maxBatchSize)        // slices of the above buffers, passed to Bind
 
 	for elemsContainer := range peer.queue.outbound.c {
 		bufs = bufs[:0]
+		toWrite = toWrite[:0]
 		if elemsContainer == nil {
 			return
 		}
@@ -511,7 +501,7 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 			// that we never accidentally keep timers alive longer than necessary.
 			elemsContainer.Lock()
 			for _, elem := range elemsContainer.elems {
-				device.PutMessageBuffer(elem.buffer)
+				elem.buffer.Release()
 				device.PutOutboundElement(elem)
 			}
 			device.PutOutboundElementsContainer(elemsContainer)
@@ -524,17 +514,19 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 				dataSent = true
 			}
 			bufs = append(bufs, elem.packet)
+			toWrite = append(toWrite, elem.buffer.Claim())
 		}
 
 		peer.timersAnyAuthenticatedPacketTraversal()
 		peer.timersAnyAuthenticatedPacketSent()
 
 		err := peer.SendBuffers(bufs)
+		iobuf.ReleaseAll(toWrite)
 		if dataSent {
 			peer.timersDataSent()
 		}
 		for _, elem := range elemsContainer.elems {
-			device.PutMessageBuffer(elem.buffer)
+			elem.buffer.Release()
 			device.PutOutboundElement(elem)
 		}
 		device.PutOutboundElementsContainer(elemsContainer)

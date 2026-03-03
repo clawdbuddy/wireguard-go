@@ -74,7 +74,6 @@ type Device struct {
 	pool struct {
 		inboundElementsContainer  *waitpool.WaitPool
 		outboundElementsContainer *waitpool.WaitPool
-		messageBuffers            *waitpool.WaitPool
 		inboundElements           *waitpool.WaitPool
 		outboundElements          *waitpool.WaitPool
 	}
