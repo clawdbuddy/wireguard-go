@@ -208,7 +208,7 @@ func (s *StdNetBind) putMessages(msgs *[]ipv6.Message) {
 		// Non coalesced write paths access only batch.msgs[i].Buffers[0],
 		// but we append more during [coalesceMessages].
 		// Leave index zero accessible:
-		(*msgs)[i] = ipv6.Message{Buffers: (*msgs)[i].Buffers[:1], OOB: (*msgs)[i].OOB}
+		(*msgs)[i] = ipv6.Message{Buffers: (*msgs)[i].Buffers[:1], OOB: (*msgs)[i].OOB[:cap((*msgs)[i].OOB)]}
 	}
 	s.msgsPool.Put(msgs)
 }
@@ -236,52 +236,91 @@ func (s *StdNetBind) receiveIP(
 	rxOffload bool,
 	bufs []iobuf.View,
 	eps []Endpoint,
-) (n int, err error) {
+) (int, error) {
 	msgs := s.getMessages()
-	iobuf.EnsureAllocated(bufs)
-	for i := range bufs {
-		(*msgs)[i].Buffers[0] = bufs[i].Bytes
-		(*msgs)[i].OOB = (*msgs)[i].OOB[:cap((*msgs)[i].OOB)]
-	}
 	defer s.putMessages(msgs)
-	var numMsgs int
-	if runtime.GOOS == "linux" {
-		if rxOffload {
-			readAt := len(*msgs) - 2
-			numMsgs, err = br.ReadBatch((*msgs)[readAt:], 0)
-			if err != nil {
-				return 0, err
-			}
-			numMsgs, err = splitCoalescedMessages(*msgs, readAt, getGSOSize)
-			if err != nil {
-				return 0, err
-			}
-		} else {
-			numMsgs, err = br.ReadBatch(*msgs, 0)
-			if err != nil {
-				return 0, err
+	readData := make([]*iobuf.Shared, len(*msgs)) // TODO: optimize this allocation
+	defer func() {
+		for i := range readData {
+			if readData[i] != nil {
+				// release backing arrays for any unclaimed buffers
+				readData[i].Release()
+				readData[i] = nil
 			}
 		}
-	} else {
+	}()
+
+	switch {
+	case runtime.GOOS == "linux" && rxOffload:
+		const readBatchSize = 2
+		for i := range readBatchSize {
+			readData[i] = iobuf.SharedBufPool.Get()
+			(*msgs)[i].Buffers[0] = readData[i].Bytes[:]
+		}
+		msgsN, err := br.ReadBatch((*msgs)[:readBatchSize], 0)
+		if err != nil {
+			return 0, err // expect atomic reads
+		}
+		var n int
+		for i, msg := range (*msgs)[:msgsN] {
+			if msg.N == 0 {
+				continue
+			}
+			gsoSize, err := getGSOSize(msg.OOB[:msg.NN])
+			if err != nil {
+				return n, err
+			}
+			if gsoSize == 0 {
+				gsoSize = msg.N
+			}
+			split, err := readData[i].SplitCoalesced(bufs[n:], gsoSize, msg.N)
+			if err != nil {
+				return n, err
+			}
+			addrPort := msg.Addr.(*net.UDPAddr).AddrPort()
+			ep := &StdNetEndpoint{AddrPort: addrPort} // TODO: remove allocation
+			getSrcFromControl(msg.OOB[:msg.NN], ep)
+			for j := n; j < n+split; j++ {
+				eps[j] = ep
+			}
+			n += split
+		}
+		return n, nil
+	case runtime.GOOS == "linux":
+		readBatchSize := min(len(bufs), len(*msgs))
+		for i := range readBatchSize {
+			readData[i] = iobuf.SharedBufPool.Get()
+			(*msgs)[i].Buffers[0] = readData[i].Bytes[:]
+		}
+		n, err := br.ReadBatch((*msgs)[:readBatchSize], 0)
+		if err != nil {
+			return 0, err // expect atomic reads
+		}
+		for i, msg := range (*msgs)[:n] {
+			if msg.N == 0 {
+				n-- // don't count empty messages toward return value
+				continue
+			}
+			readData[i].Refer(&bufs[i], 0, msg.N)
+			addrPort := msg.Addr.(*net.UDPAddr).AddrPort()
+			ep := &StdNetEndpoint{AddrPort: addrPort} // TODO: remove allocation
+			getSrcFromControl(msg.OOB[:msg.NN], ep)
+			eps[i] = ep
+		}
+		return n, nil
+	default:
 		msg := &(*msgs)[0]
-		msg.N, msg.NN, _, msg.Addr, err = conn.ReadMsgUDP(msg.Buffers[0], msg.OOB)
+		readData[0] = iobuf.SharedBufPool.Get()
+		n, _, _, addr, err := conn.ReadMsgUDP(readData[0].Bytes[:], msg.OOB)
 		if err != nil {
 			return 0, err
 		}
-		numMsgs = 1
-	}
-	for i := 0; i < numMsgs; i++ {
-		msg := &(*msgs)[i]
-		bufs[i].Bytes = bufs[i].Bytes[:msg.N]
-		if len(bufs[i].Bytes) == 0 {
-			continue
-		}
-		addrPort := msg.Addr.(*net.UDPAddr).AddrPort()
-		ep := &StdNetEndpoint{AddrPort: addrPort} // TODO: remove allocation
+		readData[0].Refer(&bufs[0], 0, n)
+		ep := &StdNetEndpoint{AddrPort: addr.AddrPort()}
 		getSrcFromControl(msg.OOB[:msg.NN], ep)
-		eps[i] = ep
+		eps[0] = ep
+		return 1, nil
 	}
-	return numMsgs, nil
 }
 
 func (s *StdNetBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
