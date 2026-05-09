@@ -10,6 +10,7 @@ package conn
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"log"
 	"sync"
 )
 
@@ -28,6 +29,7 @@ var _ Bind = (*ObfuscatingBind)(nil)
 
 // NewObfuscatingBind creates a new ObfuscatingBind wrapping the provided Bind.
 func NewObfuscatingBind(bind Bind) *ObfuscatingBind {
+	log.Printf("WireGuard QUIC obfuscation enabled")
 	return &ObfuscatingBind{
 		Bind:          bind,
 		connectionIDs: make(map[string][8]byte),
@@ -68,6 +70,7 @@ func (b *ObfuscatingBind) getConnectionID(ep Endpoint) [8]byte {
 // Send implements Bind.Send. It prepends a QUIC-like header to each packet.
 func (b *ObfuscatingBind) Send(bufs [][]byte, ep Endpoint, offset int) error {
 	cid := b.getConnectionID(ep)
+	log.Printf("WireGuard QUIC obfuscation: sending %d packets to %s, CID=%x", len(bufs), ep.DstToString(), cid[:4])
 
 	for _, buf := range bufs {
 		if len(buf) < offset {
@@ -161,6 +164,7 @@ func (b *ObfuscatingBind) wrapReceiveFunc(fn ReceiveFunc) ReceiveFunc {
 			return n, err
 		}
 
+		strippedCount := 0
 		for i := 0; i < n; i++ {
 			packet := packets[i]
 			size := sizes[i]
@@ -186,6 +190,8 @@ func (b *ObfuscatingBind) wrapReceiveFunc(fn ReceiveFunc) ReceiveFunc {
 			if size < quicHdrLen {
 				continue
 			}
+
+			strippedCount++
 
 			// Determine original WireGuard message type
 			var msgType byte
@@ -213,6 +219,10 @@ func (b *ObfuscatingBind) wrapReceiveFunc(fn ReceiveFunc) ReceiveFunc {
 			packet[wireGuardOffset] = msgType
 
 			sizes[i] = packetLen
+		}
+
+		if strippedCount > 0 {
+			log.Printf("WireGuard QUIC obfuscation: stripped QUIC headers from %d packets", strippedCount)
 		}
 
 		return n, nil
