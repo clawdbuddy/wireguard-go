@@ -6,7 +6,7 @@
 package device
 
 import (
-	"github.com/tailscale/wireguard-go/device/afalg"
+	"github.com/clawdbuddy/wireguard-go/device/afalg"
 )
 
 // On Linux, run the shared AEAD compatibility test suite against the

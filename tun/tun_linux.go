@@ -17,8 +17,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/tailscale/wireguard-go/conn"
-	"github.com/tailscale/wireguard-go/rwcancel"
+	"github.com/clawdbuddy/wireguard-go/conn"
+	"github.com/clawdbuddy/wireguard-go/rwcancel"
 	"golang.org/x/sys/unix"
 )
 

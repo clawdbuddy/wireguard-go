@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tailscale/wireguard-go/conn"
-	"github.com/tailscale/wireguard-go/tun/tuntest"
+	"github.com/clawdbuddy/wireguard-go/conn"
+	"github.com/clawdbuddy/wireguard-go/tun/tuntest"
 )
 
 // TestSetPrivateKeyConsumeInitiationDeadlock verifies that SetPrivateKey and

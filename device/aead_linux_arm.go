@@ -10,7 +10,7 @@ import (
 	"log"
 	"sync"
 
-	"github.com/tailscale/wireguard-go/device/afalg"
+	"github.com/clawdbuddy/wireguard-go/device/afalg"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/sys/cpu"
 )
@@ -29,7 +29,7 @@ import (
 // on HWCAP_NEON and additionally probe with a known-answer self-test
 // in case the kernel lacks the algorithm or produces wrong output.
 //
-// See https://github.com/tailscale/wireguard-go/pull/57 for the
+// See https://github.com/clawdbuddy/wireguard-go/pull/57 for the
 // real-hardware benchmark numbers behind this policy.
 
 var (

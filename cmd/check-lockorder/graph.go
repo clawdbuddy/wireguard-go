@@ -247,9 +247,9 @@ func formatCycle(cycle []LockID) string {
 
 // shortName strips the package path from a function name.
 //
-//	"(*github.com/tailscale/wireguard-go/device.Device).SetPrivateKey" → "(*Device).SetPrivateKey"
-//	"(github.com/tailscale/wireguard-go/device.Peer).Foo"              → "(Peer).Foo"
-//	"github.com/tailscale/wireguard-go/device.SomeFunc"                → "SomeFunc"
+//	"(*github.com/clawdbuddy/wireguard-go/device.Device).SetPrivateKey" → "(*Device).SetPrivateKey"
+//	"(github.com/clawdbuddy/wireguard-go/device.Peer).Foo"              → "(Peer).Foo"
+//	"github.com/clawdbuddy/wireguard-go/device.SomeFunc"                → "SomeFunc"
 func shortName(fullName string) string {
 	leading := ""
 	s := fullName

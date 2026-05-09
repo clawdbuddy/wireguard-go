@@ -19,7 +19,7 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-const targetPkg = "github.com/tailscale/wireguard-go/device"
+const targetPkg = "github.com/clawdbuddy/wireguard-go/device"
 
 func main() {
 	verbose := flag.Bool("v", false, "list the lock inventory and all observed lock-after edges")

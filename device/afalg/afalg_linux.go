@@ -24,7 +24,7 @@
 // kernel too (so each syscall costs ~1ms of TCG overhead and AF_ALG
 // looks artificially terrible). Neither resembles a real ARM device.
 //
-// See https://github.com/tailscale/wireguard-go/pull/57 for example
+// See https://github.com/clawdbuddy/wireguard-go/pull/57 for example
 // benchmark numbers across amd64, arm64, ARMv6, and ARMv7+NEON.
 package afalg
 
