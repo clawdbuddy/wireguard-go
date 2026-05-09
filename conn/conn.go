@@ -19,6 +19,16 @@ const (
 	IdealBatchSize = 128 // maximum number of packets handled per read and write
 )
 
+// WireGuard message types (mirrored from device package for obfuscation)
+const (
+	MessageInitiationType             = 1
+	MessageResponseType               = 2
+	MessageCookieReplyType            = 3
+	MessageTransportType              = 4
+	MessageHandshakeSize              = 148 // largest handshake related message
+	MessageEncapsulatingTransportSize = 8   // space preceding transport header for conn.Send()
+)
+
 // A ReceiveFunc receives at least one packet from the network and writes them
 // into packets. On a successful read it returns the number of elements of
 // sizes, packets, and endpoints that should be evaluated. Some elements of
