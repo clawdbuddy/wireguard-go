@@ -70,7 +70,6 @@ func (b *ObfuscatingBind) getConnectionID(ep Endpoint) [8]byte {
 // Send implements Bind.Send. It prepends a QUIC-like header to each packet.
 func (b *ObfuscatingBind) Send(bufs [][]byte, ep Endpoint, offset int) error {
 	cid := b.getConnectionID(ep)
-	log.Printf("WireGuard QUIC obfuscation: sending %d packets to %s, CID=%x", len(bufs), ep.DstToString(), cid[:4])
 
 	for _, buf := range bufs {
 		if len(buf) < offset {
@@ -158,13 +157,15 @@ func (b *ObfuscatingBind) Open(port uint16) (fns []ReceiveFunc, actualPort uint1
 }
 
 func (b *ObfuscatingBind) wrapReceiveFunc(fn ReceiveFunc) ReceiveFunc {
+	var strippedTotal int64
+
 	return func(packets [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
 		n, err = fn(packets, sizes, eps)
 		if err != nil || n == 0 {
 			return n, err
 		}
 
-		strippedCount := 0
+		stripped := 0
 		for i := 0; i < n; i++ {
 			packet := packets[i]
 			size := sizes[i]
@@ -172,57 +173,31 @@ func (b *ObfuscatingBind) wrapReceiveFunc(fn ReceiveFunc) ReceiveFunc {
 				continue
 			}
 
-			// Check if this looks like a QUIC packet
 			firstByte := packet[0]
 
 			var quicHdrLen int
 			if (firstByte & 0x80) != 0 {
-				// Long header
 				quicHdrLen = quicLongHdrLen
 			} else if (firstByte & 0x40) != 0 {
-				// Short header
 				quicHdrLen = quicShortHdrLen
 			} else {
-				// Not a QUIC packet (or already stripped)
 				continue
 			}
 
-			if size < quicHdrLen {
+			if size <= quicHdrLen {
 				continue
 			}
 
-			strippedCount++
+			stripped++
 
-			// Determine original WireGuard message type
-			var msgType byte
-			if (firstByte & 0x80) != 0 {
-				// Long header - check packet type
-				// For WireGuard, we'll treat all long header as handshake
-				msgType = MessageInitiationType // Use Initiation as placeholder
-			} else {
-				// Short header - WireGuard transport
-				msgType = MessageTransportType
-			}
-
-			// Copy packet data to strip QUIC header
-			packetLen := size - quicHdrLen
-			copy(packet[quicHdrLen:], packet[:packetLen])
-
-			// Restore WireGuard header at offset MessageEncapsulatingTransportSize (8)
-			// The WireGuard header starts with message type
-			wireGuardOffset := MessageEncapsulatingTransportSize
-			if packetLen < wireGuardOffset {
-				continue
-			}
-
-			// Set the message type to indicate transport
-			packet[wireGuardOffset] = msgType
-
-			sizes[i] = packetLen
+			wgLen := size - quicHdrLen
+			copy(packet[:wgLen], packet[quicHdrLen:size])
+			sizes[i] = wgLen
 		}
 
-		if strippedCount > 0 {
-			log.Printf("WireGuard QUIC obfuscation: stripped QUIC headers from %d packets", strippedCount)
+		if stripped > 0 {
+			strippedTotal += int64(stripped)
+			log.Printf("WireGuard QUIC obfuscation: stripped %d QUIC headers (total: %d)", stripped, strippedTotal)
 		}
 
 		return n, nil
