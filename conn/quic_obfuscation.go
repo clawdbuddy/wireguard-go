@@ -104,7 +104,9 @@ func (b *ObfuscatingBind) Send(bufs [][]byte, ep Endpoint, offset int) error {
 		if quicHdrLen+copyLen > len(buf) {
 			copyLen = len(buf) - quicHdrLen
 		}
-		copy(buf[quicHdrLen:quicHdrLen+copyLen], buf[offset:offset+copyLen])
+		if copyLen > 0 {
+			copy(buf[quicHdrLen:quicHdrLen+copyLen], buf[offset:offset+copyLen])
+		}
 
 		// Write QUIC header at position 0
 		if msgType >= MessageInitiationType && msgType <= MessageCookieReplyType {
