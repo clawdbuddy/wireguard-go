@@ -199,7 +199,9 @@ func TestObfuscatingBindRoundTrip(t *testing.T) {
 		t.Fatalf("Open failed: %v", err)
 	}
 
-	packets := [][]byte{make([]byte, 128)}
+	// The obfuscated packet is larger than the original buffer
+	// (QUIC header 11 bytes replaces 8-byte offset, so +3 bytes).
+	packets := [][]byte{make([]byte, 256)}
 	sizes := []int{0}
 	eps := []Endpoint{&StdNetEndpoint{}}
 
@@ -213,9 +215,9 @@ func TestObfuscatingBindRoundTrip(t *testing.T) {
 	}
 
 	// Verify the data matches what we sent
-	// Original: 128 bytes, QUIC hdr 11 bytes, so stripped = 117 bytes
-	if sizes[0] != 117 {
-		t.Fatalf("Expected size 117, got %d", sizes[0])
+	// Original WG payload: 120 bytes (128 - 8 offset), should all be preserved.
+	if sizes[0] != 120 {
+		t.Fatalf("Expected size 120, got %d", sizes[0])
 	}
 
 	// The WireGuard type should be at position 0 (shifted from original offset 8)

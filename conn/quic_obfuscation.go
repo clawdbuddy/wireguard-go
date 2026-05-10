@@ -71,7 +71,8 @@ func (b *ObfuscatingBind) getConnectionID(ep Endpoint) [8]byte {
 func (b *ObfuscatingBind) Send(bufs [][]byte, ep Endpoint, offset int) error {
 	cid := b.getConnectionID(ep)
 
-	for _, buf := range bufs {
+	for i := range bufs {
+		buf := bufs[i]
 		if len(buf) < offset {
 			continue
 		}
@@ -95,17 +96,17 @@ func (b *ObfuscatingBind) Send(bufs [][]byte, ep Endpoint, offset int) error {
 		}
 
 		packetLen := len(buf) - offset
+		needLen := quicHdrLen + packetLen
 
-		// Copy packet data to make room for QUIC header at position 0
-		// Original: [prefix zeros][WireGuard at offset][content]
-		// After:    [QUIC header][WireGuard at offset][content]
-		// Use min of packetLen and available space
-		copyLen := packetLen
-		if quicHdrLen+copyLen > len(buf) {
-			copyLen = len(buf) - quicHdrLen
-		}
-		if copyLen > 0 {
-			copy(buf[quicHdrLen:quicHdrLen+copyLen], buf[offset:offset+copyLen])
+		// If the buffer can't hold the QUIC header + payload in place,
+		// allocate a new one to avoid truncating the WireGuard payload.
+		if cap(buf) < needLen {
+			newBuf := make([]byte, needLen)
+			copy(newBuf[quicHdrLen:], buf[offset:offset+packetLen])
+			buf = newBuf
+		} else {
+			buf = buf[:needLen]
+			copy(buf[quicHdrLen:needLen], buf[offset:offset+packetLen])
 		}
 
 		// Write QUIC header at position 0
@@ -136,6 +137,8 @@ func (b *ObfuscatingBind) Send(bufs [][]byte, ep Endpoint, offset int) error {
 			counter := binary.LittleEndian.Uint64(buf[quicHdrLen+8:])
 			binary.LittleEndian.PutUint16(buf[9:], uint16(counter))
 		}
+
+		bufs[i] = buf
 	}
 
 	// Send from position 0 (QUIC header is now at the front)
