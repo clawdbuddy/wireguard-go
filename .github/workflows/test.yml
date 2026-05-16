@@ -66,6 +66,7 @@ jobs:
         go-version-file: go.mod
     - name: test
       run: go test -race -v ./...
+      timeout-minutes: 10
 
   check-lockorder:
     runs-on: ubuntu-22.04
